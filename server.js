@@ -29,6 +29,7 @@ var semver = require('semver');
 var serverStartTime = new Date((new Date()).toGMTString());
 
 var validTemplates = ['default', 'plastic', 'flat', 'flat-square', 'social'];
+var darkBackgroundTemplates = ['default', 'flat', 'flat-square'];
 var logos = loadLogos();
 
 // Analytics
@@ -157,8 +158,8 @@ var minAccuracy = 0.75;
 //       = 1 - max(1, df) / rf
 var freqRatioMax = 1 - minAccuracy;
 
-// Request cache size of 50MB (~5000 bytes/image).
-var requestCache = new LruCache(0); // 10000
+// Request cache size of 5MB (~5000 bytes/image).
+var requestCache = new LruCache(1000);
 
 // Deep error handling for vendor hooks.
 var vendorDomain = domain.create();
@@ -190,7 +191,6 @@ function cache(f) {
     var cachedVersionSent = false;
     if (cached !== undefined) {
       // A request was made not long ago.
-      var interval = 30000;  // In milliseconds.
       var tooSoon = (+reqTime - cached.time) < cached.interval;
       if (tooSoon || (cached.dataChange / cached.reqs <= freqRatioMax)) {
         badge(cached.data.badgeData, makeSend(cached.data.format, ask.res, end));
@@ -307,15 +307,15 @@ cache(function(data, match, sendBadge, request) {
       return;
     }
     try {
-      var res = res.headers['content-disposition']
-                   .match(/filename="(.+)\.svg"/)[1];
-      badgeData.text[1] = res;
-      if (res === 'passing') {
+      var state = res.headers['content-disposition']
+                     .match(/filename="(.+)\.svg"/)[1];
+      badgeData.text[1] = state;
+      if (state === 'passing') {
         badgeData.colorscheme = 'brightgreen';
-      } else if (res === 'failing') {
+      } else if (state === 'failing') {
         badgeData.colorscheme = 'red';
       } else {
-        badgeData.text[1] = res;
+        badgeData.text[1] = state;
       }
       sendBadge(format, badgeData);
 
@@ -883,7 +883,7 @@ cache(function(data, match, sendBadge, request) {
     }
     try {
       var data = JSON.parse(buffer);
-      badgeData.text[1] = metric(+data.count);
+      badgeData.text[1] = metric(+data.count[data.count.length-1]);
       badgeData.colorscheme = 'blue';
       sendBadge(format, badgeData);
     } catch(e) {
@@ -1998,7 +1998,7 @@ cache(function(data, match, sendBadge, request) {
     }
     try {
       var score = res.headers['content-disposition']
-                     .match(/filename="coverage_(.+)\.png"/)[1];
+                     .match(/filename=".*coverage_(.+)\.png"/)[1];
       if (!score) {
         badgeData.text[1] = 'malformed';
         sendBadge(format, badgeData);
@@ -2039,7 +2039,7 @@ cache(function(data, match, sendBadge, request) {
     }
     try {
       var statusMatch = res.headers['content-disposition']
-                           .match(/filename="code_climate-(.+)\.png"/);
+                           .match(/filename=".*code_climate-(.+)\.png"/);
       if (!statusMatch) {
         badgeData.text[1] = 'unknown';
         sendBadge(format, badgeData);
@@ -2305,7 +2305,9 @@ cache(function(data, match, sendBadge, request) {
       badgeData.text[1] = res;
       if (res === 'up to date') {
         badgeData.colorscheme = 'brightgreen';
-      } else if (statusMatch === 'out of date') {
+      } else if (res === 'none') {
+        badgeData.colorscheme = 'green';
+      } else if (res === 'out of date') {
         badgeData.colorscheme = 'yellow';
       } else {
         badgeData.colorscheme = 'red';
@@ -2633,15 +2635,27 @@ cache(function(data, match, sendBadge, request) {
 }));
 
 // GitHub release-download-count integration.
-camp.route(/^\/github\/downloads\/([^\/]+)\/([^\/]+)\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/github\/downloads\/([^\/]+)\/([^\/]+)(\/[^\/]+)?\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
   var user = match[1];  // eg, qubyte/rubidium
   var repo = match[2];
-  var tag = match[3];
+
+  var tag = match[3]; //null for all releases
   var asset_name = match[4].toLowerCase(); // eg. total, atom-amd64.deb, atom.x86_64.rpm
   var format = match[5];
-  var release_path = tag !== 'latest' ? 'tags/' + match[3] : 'latest';
-  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo + '/releases/' + release_path;
+
+  if (tag) { tag = tag.slice(1); }
+
+  var total = true;
+  if (tag) {
+    total = false;
+  }
+
+  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo + '/releases';
+  if (!total) {
+    var release_path = tag !== 'latest' ? 'tags/' + tag : 'latest';
+    apiUrl = apiUrl + '/' + release_path;
+  }
   // Using our OAuth App secret grants us 5000 req/hour
   // instead of the standard 60 req/hour.
   if (serverSecrets) {
@@ -2665,14 +2679,32 @@ cache(function(data, match, sendBadge, request) {
       }
       var data = JSON.parse(buffer);
       var downloads = 0;
-      data.assets.forEach(function (asset) {
-        if (asset_name === 'total' || asset_name === asset.name.toLowerCase()) {
-          downloads += asset.download_count;
+
+      var label;
+      if (total) {
+        data.forEach(function (tagData) {
+          tagData.assets.forEach(function (asset) {
+            if (asset_name === 'total' || asset_name === asset.name.toLowerCase()) {
+              downloads += asset.download_count;
+            }
+          });
+        });
+
+        label = 'total';
+        if (asset_name !== 'total') {
+          label += ' ' + '[' + asset_name + ']';
         }
-      });
-      var label = tag !== 'latest' ?  tag : '';
-      if (asset_name !== 'total') {
-        label += ' ' + '[' + asset_name + ']';
+      } else {
+        data.assets.forEach(function (asset) {
+          if (asset_name === 'total' || asset_name === asset.name.toLowerCase()) {
+            downloads += asset.download_count;
+          }
+        });
+
+        label = tag !== 'latest' ?  tag : '';
+        if (asset_name !== 'total') {
+          label += ' ' + '[' + asset_name + ']';
+        }
       }
       badgeData.text[1] = metric(downloads) + ' ' + label;
       badgeData.colorscheme = 'brightgreen';
@@ -4196,7 +4228,8 @@ cache(function(data, match, sendBadge, request) {
   var path = match[2];   // eg, shields.io
   var format = match[3];
   var page = encodeURIComponent(scheme + '://' + path);
-  var url = 'http://cdn.api.twitter.com/1/urls/count.json?url=' + page;
+  // The URL API died: #568.
+  //var url = 'http://cdn.api.twitter.com/1/urls/count.json?url=' + page;
   var badgeData = getBadgeData('tweet', data);
   if (badgeData.template === 'social') {
     badgeData.logo = badgeData.logo || logos.twitter;
@@ -4205,21 +4238,44 @@ cache(function(data, match, sendBadge, request) {
       'https://twitter.com/search?q=' + page,
      ];
   }
-  request(url, function(err, res, buffer) {
+  badgeData.text[1] = '';
+  badgeData.colorscheme = '55ACEE';
+  sendBadge(format, badgeData);
+}));
+
+// Twitter follow badge.
+camp.route(/^\/twitter\/follow\/@?([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var user = match[1]; // eg, shields_io
+  var format = match[2];
+  var options = {
+    url: 'http://cdn.syndication.twimg.com/widgets/followbutton/info.json?screen_names=' + user
+  };
+  var badgeData = getBadgeData('Follow', data);
+  badgeData.text[0] = 'Follow ' + user;
+  badgeData.colorscheme = '55ACEE';
+  badgeData.logo = badgeData.logo || logos.twitter;
+  badgeData.links = [
+    'https://twitter.com/intent/follow?screen_name=' + user,
+    'https://twitter.com/' + user + '/followers'
+  ];
+  badgeData.text[1] = '';
+  request(options, function(err, res, buffer) {
     if (err != null) {
-      badgeData.text[1] = 'inaccessible';
       sendBadge(format, badgeData);
       return;
     }
     try {
-      var data = JSON.parse(buffer);
-      badgeData.text[1] = metric(data.count);
-      badgeData.colorscheme = '55ACEE';
-      sendBadge(format, badgeData);
+      // The data is formatted as an array.
+      var data = JSON.parse(buffer)[0];
+      // data.followers_count could be zero… don't just check if falsey.
+      if (data.followers_count != null){
+        badgeData.text[1] = metric(data.followers_count);
+      }
     } catch(e) {
-      badgeData.text[1] = 'invalid';
-      sendBadge(format, badgeData);
+      console.error(e);
     }
+    sendBadge(format, badgeData);
   });
 }));
 
@@ -4255,6 +4311,66 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
+// ImageLayers.io integration.
+camp.route(/^\/imagelayers\/(image\-size|layers)\/([^\/]+)\/([^\/]+)\/([^\/]*)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var type = match[1];
+  var user = match[2];
+  var repo = match[3];
+  var tag = match[4]
+  var format = match[5];
+  if (user === '_') {
+    user = 'library';
+  }
+  var path = user + '/' + repo;
+  var badgeData = getBadgeData(type, data);
+  var options = {
+    method: 'POST',
+    json: true,
+    body: {
+      "repos": [{"name": path, "tag": tag}]
+    },
+    uri: 'https://imagelayers.io:8888/registry/analyze'
+  };
+  request(options, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      if (type == 'image-size') {
+        size = metric(buffer[0].repo.size) + "B";
+        badgeData.text[0] = 'image size';
+        badgeData.text[1] = size;
+      } else if (type == 'layers') {
+        badgeData.text[1] = buffer[0].repo.count;
+      }
+      badgeData.colorscheme = null;
+      badgeData.colorB = '#007ec6';
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// Gitter room integration.
+camp.route(/^\/gitter\/room\/([^\/]+\/[^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var userRepo = match[1];
+  var format = match[2];
+
+  var badgeData = getBadgeData('chat', data);
+  badgeData.text[1] = 'on gitter';
+  badgeData.colorscheme = 'brightgreen';
+  if (darkBackgroundTemplates.some(function(t) { return t === badgeData.template; })) {
+    badgeData.logo = badgeData.logo || logos['gitter-white'];
+    badgeData.logoWidth = 7;
+  }
+  sendBadge(format, badgeData);
+}));
 
 // Any badge.
 camp.route(/^\/(:|badge\/)(([^-]|--)*?)-(([^-]|--)*)-(([^-]|--)+)\.(svg|png|gif|jpg)$/,
@@ -4734,4 +4850,43 @@ function phpStableVersion(version) {
   }
   // normal or patch
   return (versionData.modifier === 3) || (versionData.modifier === 4);
+}
+
+// This searches the serverSecrets for a twitter consumer key
+// and secret, and exchanges them for a bearer token to use for all requests.
+function fetchTwitterToken() {
+  if(serverSecrets.twitter_consumer_key && serverSecrets.twitter_consumer_secret){
+    // fetch a bearer token good for this app session
+    // construct this bearer request with a base64 encoding of key:secret
+    // docs for this are here: https://dev.twitter.com/oauth/application-only
+    var twitter_bearer_credentials = escape(serverSecrets.twitter_consumer_key) + ':' + escape(serverSecrets.twitter_consumer_secret);
+    var options = {
+      url: 'https://api.twitter.com/oauth2/token',
+      headers: {
+        // is this the best way to base 64 encode a string?
+        Authorization: 'Basic '+(new Buffer(twitter_bearer_credentials)).toString('base64'),
+        'Content-type': 'application/x-www-form-urlencoded;charset=UTF-8'
+      },
+      form: 'grant_type=client_credentials',
+      method: 'POST'
+    };
+    console.log('Fetching twitter bearer token...');
+    request(options,function(err,res,buffer){
+      if(err){
+        console.error('Error fetching twitter bearer token, error: ', err);
+        return;
+      }
+      try{
+        var data = JSON.parse(buffer);
+        if(data.token_type === 'bearer'){
+          serverSecrets.twitter_bearer_token = data.access_token;
+          console.log('Fetched twitter bearer token');
+          return;
+        }
+        console.error('Error fetching twitter bearer token, data: %j', data);
+      } catch(e) {
+        console.error('Error fetching twitter bearer token, buffer: %s, ', buffer, e);
+      }
+    });
+  }
 }
